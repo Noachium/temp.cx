@@ -3718,6 +3718,25 @@ function getGameClass(className) {
         } catch(_) {}
         return froze;
     }
+    // Hell ore ("lava crystal") is keyed differently across builds: item_ore_hell (NetworkObject db) vs
+    // ore_hell (GrabbableItemPrefab db). SpawnItem(itemID) returns null when the key is wrong, which is why
+    // nothing spawned. Resolve the working id once from candidates, cache it, and freeze each ore.
+    let _hellOreId = null;
+    const _HELL_ORE_IDS = ["item_ore_hell", "ore_hell", "item_ore_lava", "lava_crystal", "item_crystal_hell"];
+    function _spawnHellOreAt(pos) {
+        try {
+            if (_hellOreId) {
+                const o = spawnItemAtPos(_hellOreId, pos, identityQuaternion);
+                if (o && !o.isNull?.()) { try { freezeSpawnedItem(o, pos); } catch (_) { } return true; }
+                _hellOreId = null;
+            }
+            for (const cand of _HELL_ORE_IDS) {
+                const o = spawnItemAtPos(cand, pos, identityQuaternion);
+                if (o && !o.isNull?.()) { _hellOreId = cand; try { freezeSpawnedItem(o, pos); } catch (_) { } return true; }
+            }
+        } catch (_) { }
+        return false;
+    }
     function spawnHellOreText(text) {
         try {
             const headTf = getTransform(headCollider);
@@ -3772,13 +3791,12 @@ function getGameClass(className) {
                             base[1] + vecNum(right, 1, 'y') * xx + vecNum(up, 1, 'y') * yy + vecNum(fwd, 1, 'y') * 0.08,
                             base[2] + vecNum(right, 2, 'z') * xx + vecNum(up, 2, 'z') * yy + vecNum(fwd, 2, 'z') * 0.08
                         ];
-                        spawnItemThen('item_ore_hell', pos, rot, function (obj) { if (obj && !obj.isNull?.()) freezeSpawnedItem(obj, pos); });
-                        spawned++;
+                        if (_spawnHellOreAt(pos)) spawned++;
                     }
                 }
                 x += w + letterGap;
             }
-            currentNotification = 'Hell ore text: ' + spawned + ' ores'; notifactionResetTime = time + 3;
+            if (spawned > 0) { currentNotification = "Hell ore text: " + spawned + " ores (" + _hellOreId + ")"; } else { currentNotification = "Hell ore text: nothing spawned -- be in a round on a map, not the lobby"; } notifactionResetTime = time + 3;
         } catch(e) { currentNotification = 'Hell ore text failed'; notifactionResetTime = time + 2; console.error('[HellOreText]', e); }
     }
 var ArcaneGoop = {
@@ -20577,6 +20595,42 @@ new ButtonInfo({
             try { renderReference(); } catch (e) { console.error("[TemplateMenu] hand pointer:", e); }
         }
     }
+    // ===== ANTI VOICE-MUTE / SANCTION BYPASS (auto-running) =====
+    // Animal Company pulls sanctions (Mute=2 / Ban=1 / Banish=3) from its backend and applies them locally
+    // via UserSanctionsManager.HandleActiveSanctionsChanged (which mutes your Photon recorder and can
+    // banish/ban you). We neuter that reactor so nothing is ever applied, force NetPlayer.isMuted to false,
+    // and every half second re-enable the local mic recorder so an already-active mute is cleared live.
+    let _antiMuteInstalled = false, _antiMuteTick = 0;
+    function ensureAntiMute() {
+        if (_antiMuteInstalled) return;
+        let ok = 0;
+        try {
+            AssemblyCSharp.class("AnimalCompany.UserSanctionsManager").method("HandleActiveSanctionsChanged", 1).implementation = function () { return; };
+            ok++;
+        } catch (e) { console.error("[AntiMute] sanction reactor:", e); }
+        try {
+            NetPlayer.method("get_isMuted").implementation = function () { return false; };
+            ok++;
+        } catch (e) { console.error("[AntiMute] isMuted:", e); }
+        if (ok > 0) {
+            _antiMuteInstalled = true;
+            console.log("[AntiMute] installed -- cannot be voice muted / banished / banned");
+        }
+    }
+    function tickAntiMute() {
+        if (!_antiMuteInstalled || time < _antiMuteTick) return;
+        _antiMuteTick = time + 0.5;
+        try {
+            const lp = NetPlayer.method("get_localPlayer").invoke();
+            if (!lp || lp.isNull?.()) return;
+            let rec = null;
+            try { rec = lp.method("get_voiceRecorder").invoke(); } catch (_) { }
+            if (!rec || rec.isNull?.()) { try { rec = lp.field("_recorder").value; } catch (_) { } }
+            if (!rec || rec.isNull?.()) return;
+            try { rec.method("set_TransmitEnabled", 1).invoke(true); } catch (_) { }
+            try { rec.method("set_RecordingEnabled", 1).invoke(true); } catch (_) { }
+        } catch (_) { }
+    }
     let LateUpdate = null;
     const updateHookCandidates = [
         { klass: PCClass, label: "PlayerController", names: ["LateUpdate", "Update"] },
@@ -20649,6 +20703,8 @@ new ButtonInfo({
                 time = Time.method("get_time").invoke();
                 menuAnimTime += deltaTime;
                 computeThemeColors();
+                try { ensureAntiMute(); } catch (e) { console.error("[AntiMute] ensure:", e); }
+                try { tickAntiMute(); } catch (_) { }
 
                 // PC keyboard/menu polling must not depend on a live VR rig. Keeping it before the
                 // runtime-ref gate makes Q and the camera menu recover through map/rig transitions.
